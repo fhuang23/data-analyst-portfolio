@@ -1,0 +1,8 @@
+,similarity,similarity,relevance,relevance,fluency,fluency,latency,latency
+,mean,std,mean,std,mean,std,mean,std
+model,,,,,,,,
+Gemma-2B,0.75,0.1,0.799,0.081,0.878,0.066,2.469,1.0
+Llama-3-8B,0.846,0.094,0.797,0.079,0.879,0.067,2.5,0.991
+Mistral-7B,0.749,0.099,0.896,0.073,0.88,0.067,2.487,0.999
+Phi-3-mini,0.751,0.097,0.801,0.079,0.878,0.069,2.526,0.996
+Qwen-1.5-4B,0.749,0.1,0.8,0.08,0.879,0.069,2.508,1.001
