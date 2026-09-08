@@ -1,0 +1,14 @@
+# --- core measurement layer (steps 1-2): no key needed to self-test ---
+numpy>=1.24.0
+anthropic>=0.40.0          # maker + LLM-judge
+
+# --- retrieval layer (step 4) ---
+pymupdf>=1.24.0            # PDF text + page numbers (in_context, chunking)
+
+# embedding backend: pick ONE (default 'local')
+sentence-transformers>=2.7.0   # backend=local (no API cost)
+# google-genai>=2.0.0          # backend=gemini  (text-embedding-004)
+# openai>=1.30.0               # backend=openai  (text-embedding-3-small)
+# voyageai>=0.2.0              # backend=voyage  (voyage-3)
+
+# backend=mock needs nothing beyond numpy (deterministic, for testing plumbing)
