@@ -1,33 +1,91 @@
-# Maker-Checker Financial Disclosure Analyst
+# Maker-Checker: Trustworthy QA over Financial Filings
 
-Grounded question answering over public company filings (FinanceBench), with a
-maker-checker control: one agent answers, a second audits the answer against the
-filing, and unresolved cases abstain to human review. See `DESIGN.md` for the
-full rationale and architecture.
+**A question-answering system for SEC filings that knows when *not* to answer, validated on FinanceBench with a human-checked automated judge.**
 
-This repository implements the **measurement layer**: data loading, the scorer
-FinanceBench does not ship, the judge-validation protocol (steps 1-2), and the
-**retrieval layer** (step 4) with a retrieval-quality eval scored against gold
-evidence and needing no LLM. The maker-checker agent loop is built on top once
-the judge is trusted.
+---
 
-## Why measurement first
+### The problem
 
-FinanceBench provides questions, gold answers, and gold evidence spans, but **no
-automated scorer** (its published numbers came from manual human review). So the
-first deliverable is a judge, and the first thing to establish is that the judge
-agrees with a human. Nothing downstream is meaningful until it does.
+Financial analysts spend enormous time answering factual questions from company filings: what a company's capital expenditure was, whether margins improved, whether liabilities are being managed. Large language models can attempt these, but they hallucinate specific figures, and in a financial setting a confidently wrong number is worse than no answer. A bad figure flows into a decision; a deferred question just costs an analyst a few minutes.
 
-## Layout
+### The approach
+
+This project builds a **maker-checker** question-answering system over SEC filings: one model proposes an answer with a citation, a second independently audits it against the filing, and an adjudicator resolves disagreements, abstaining and deferring to a human when the evidence does not clearly support an answer. The goal is a system that is trustworthy *when it commits*, rather than one that always answers.
+
+### The benchmark
+
+I evaluate on **FinanceBench**, an open benchmark of real questions over public company filings (10-Ks, 10-Qs, 8-Ks, earnings releases). Each question ships with an answer written by financial analysts and the exact evidence span in the filing that supports it. It is a genuinely hard benchmark: the original authors found that a strong retrieval-augmented LLM incorrectly answered or refused **~81%** of questions, which makes it a meaningful test rather than a solved one. Crucially for this project, FinanceBench provides gold *evidence spans*, which is what makes it possible to measure grounding and retrieval quality, not just final-answer accuracy.
+
+### What's inside
+
+- **A validated judge.** FinanceBench ships no scorer, so I built one and confirmed it agrees with human grading (**Cohen's kappa = 0.91**) before trusting it.
+- **The maker-checker pipeline**, measured against a single-shot baseline.
+- **A two-axis evaluation** separating reasoning quality (given the right evidence) from retrieval quality (finding the evidence).
+
+*Scope: FinanceBench open split (150 questions); the pipeline is evaluated on a 45-question stratified subset in oracle mode, reported over 3 runs.*
+
+---
+
+## Results at a glance
+
+| Metric | Result |
+| --- | --- |
+| Judge vs. human agreement (Cohen's kappa) | 0.91 |
+| Single-shot baseline accuracy | ~0.74 |
+| Pipeline answered-accuracy | ~0.82 (at ~0.64 coverage) |
+| Retrieval recall@10, document known | ~0.70 |
+| Retrieval recall@10, document unknown | ~0.59 |
+
+All figures are over the open split; pipeline metrics are means over 3 runs. At n=45 the pipeline's accuracy gain is directional rather than statistically conclusive.
+
+---
+
+## Findings & limitations
+
+**The result.** The pipeline improved answered-accuracy over the single-shot baseline by roughly 8 points, though at n=45 this is directional rather than conclusive, and the accuracy gain alone does not justify the added cost of the multi-agent pipeline. What justifies it is the **abstention**: the system declines the questions it cannot verify and defers them to a human, which is the right tradeoff when a confidently wrong financial figure is more expensive than a deferred one.
+
+**The biggest lesson: a bug disguised as a model weakness.** An output-parsing bug in the maker was silently discarding correct answers, which surfaced in the metrics as poor numerical performance. The danger was that this told a *plausible* false story: numerical reasoning is a known LLM weakness, so it would have been easy to accept and start fine-tuning the wrong thing. The real fault was upstream, in the parsing. The lesson: a metric can point confidently at the wrong component, so I learned to inspect raw outputs before trusting the score.
+
+**Limitations.** The evaluation uses the 150-question open split, with the pipeline measured on a 45-question subset, so gains are directional, not statistically significant. The maker model is not fully deterministic even at temperature 0, so results are reported over 3 runs with a variance band. A small number of the benchmark's own gold answers appear contestable, meaning the true accuracy ceiling is below 100%.
+
+**Where I'd go next.** Given more time, I would validate on a substantially larger set than the n=45 used here (kept small for cost), ideally a held-out split. And since numerical reasoning is the consistent weak spot, the clear next step is giving the maker a calculator tool, so arithmetic is executed deterministically rather than generated by the model.
+
+---
+
+## How it works
+
+A mostly deterministic pipeline with one genuinely agentic control loop:
+
+```
+question + filing evidence
+        |
+   [ Maker ]        proposes an answer with a mandatory citation
+        |
+   [ Checker ]      audits per reasoning type: verifies extraction spans,
+        |           recomputes numerical answers, hunts disconfirming
+        |           evidence for judgment questions
+        |
+   [ Adjudicator ]  resolves disagreement against the evidence,
+        |           or abstains when neither side is supported
+        v
+   accept (answer + citation)   or   abstain (route to human)
+```
+
+See `DESIGN.md` for the full rationale and architecture.
+
+## Repository structure
 
 ```
 src/
-  data_io.py         load 150 questions, reasoning buckets, stratified sample
+  data_io.py         load questions, reasoning buckets, stratified sample
   judge.py           deterministic numeric matching + LLM-judge fallback
   metrics.py         agreement, Cohen's kappa, bootstrap CIs, precision floor
-  models.py          Anthropic call wrapper (lazy import, env-driven model ids)
+  models.py          Anthropic call wrapper (env-driven model ids)
   maker.py           single-shot answerer (baseline + candidate generator)
-  chunking.py        PDF -> page-tagged chunks (pymupdf)
+  checker.py         per-reasoning-type audit + deterministic grounding check
+  adjudicator.py     resolves maker/checker disagreement or abstains
+  pipeline.py        maker -> checker -> adjudicator with abstention gate
+  chunking.py        PDF to page-tagged chunks (pymupdf)
   embeddings.py      local / gemini / openai / voyage / mock backends
   vectorstore.py     numpy cosine store + per-doc embedding cache
   retrieval.py       eval-mode ladder: oracle, in_context, single/shared store
@@ -36,89 +94,48 @@ scripts/
   01_make_validation_subset.py   stratified sample -> answers -> label template
   02_score_judge_agreement.py    human labels -> judge -> agreement + kappa
   03_eval_retrieval.py           retrieval quality vs gold evidence, no LLM
-eval/           validation subset, scored output, agreement report
-results/        retrieval eval output
-vectorstores/   per-doc embedding cache (created on first run)
-data/           financebench jsonl files
-pdfs/           source filings (fetch from the FinanceBench repo)
+  05_run_pipeline.py             pipeline vs single-shot baseline
+  06_run_pipeline_multi.py       multi-run pipeline eval with variance
+run_measurement_layer.ipynb      interactive walkthrough of the full evaluation
 ```
-
-## Run it in a notebook
-
-`run_measurement_layer.ipynb` wires steps 1-2 and 4 together for interactive use: it imports the `src/` functions directly (no CLI), pauses for you to hand-label in section 2, and shows disagreements and retrieval hits inline. Set keys with `os.environ[...]` in the first cell (the kernel won't see shell exports). Use `mock` model/embedder backends for a free dry run.
 
 ## Setup
 
 ```bash
 pip install -r requirements.txt
-export ANTHROPIC_API_KEY=...            # required for maker + LLM-judge
-export MCFB_MAKER_MODEL=claude-sonnet-4-5   # override to a model you can call
-export MCFB_JUDGE_MODEL=claude-haiku-4-5    # override to a model you can call
+export ANTHROPIC_API_KEY=...              # set in your shell, never hardcode
+export MCFB_MAKER_MODEL=<a model you can call>
+export MCFB_JUDGE_MODEL=<a model you can call>
 ```
 
-The deterministic parts (`judge.py` numeric path, `metrics.py`, `data_io.py`)
-run and self-test with **no key**:
+The deterministic parts (`judge.py` numeric path, `metrics.py`, `data_io.py`) run and self-test with no key:
 
 ```bash
 python src/judge.py      # numeric matcher self-test
 python src/metrics.py    # kappa / bootstrap / coverage self-test
-python src/data_io.py    # data load + stratification check
 ```
 
-## Run steps 1-2
+## Reproducing the evaluation
 
 ```bash
-# 1. Build the stratified validation subset and generate candidate answers.
+# 1. Build the validation subset and generate candidate answers.
 python scripts/01_make_validation_subset.py --n 45
-#    (add --dry-run to write the template with no API calls)
 
-# 2. Hand-label eval/validation_subset.csv: fill 'human_label' with
-#    'correct' or 'incorrect' for each model_answer vs gold_answer.
+# 2. Hand-label eval/validation_subset.csv (human_label: correct | incorrect).
 
-# 3. Validate the judge against your labels.
+# 3. Validate the judge against your labels (target: kappa >= 0.8).
 python scripts/02_score_judge_agreement.py --kappa-bar 0.8
-#    -> eval/judge_agreement.md  (agreement, kappa, disagreement log)
+
+# 4. Run the pipeline vs the single-shot baseline, over 3 runs.
+python scripts/06_run_pipeline_multi.py --n 45 --runs 3 --mode oracle
+
+# 5. Retrieval quality (needs source PDFs in pdfs/, no LLM).
+python scripts/03_eval_retrieval.py --mode single_store --k 10
+python scripts/03_eval_retrieval.py --mode shared_store --k 10
 ```
-
-If kappa clears the bar, the judge is trusted and you proceed to the single-shot
-baseline and then the maker-checker loop. If not, the disagreement log tells you
-which rubric or tolerance to fix before any full run.
-
-## Run step 4 (retrieval quality)
-
-Needs the source PDFs in `pdfs/` and an embedding backend. This eval uses no
-LLM: it scores whether retrieval surfaces the gold evidence.
-
-```bash
-export MCFB_EMBED_BACKEND=local        # or: gemini | openai | voyage | mock
-# single_store: doc known, find the passage
-python scripts/03_eval_retrieval.py --mode single_store --k 5
-# shared_store: realistic, find the right filing then the passage
-python scripts/03_eval_retrieval.py --mode shared_store --k 8
-# test the plumbing with no key or model download:
-python scripts/03_eval_retrieval.py --mode single_store --backend mock --available-only
-```
-
-Reads out page recall@k, text recall@k, mean containment, and (for
-`shared_store`) how often the correct filing surfaces first. The gap between
-oracle-mode reasoning accuracy and retrieval-mode accuracy is bounded by this
-recall: it is the retrieval-error budget, separated from the reasoning-error
-budget.
-
-## Judge design (summary)
-
-- Gold answers that are essentially a number (about a third of the set) are
-  scored deterministically, with scale-invariant matching so `$1577.00`,
-  `$1,577 million`, and `$1.577 billion` all agree, and percentages compared at
-  face value.
-- Everything else (yes/no with justification, qualitative claims) goes to an
-  LLM-judge given the gold answer and the CFA justification as reference.
-- If a numeric answer will not parse cleanly on both sides, it defers to the
-  LLM-judge rather than guess.
 
 ## Notes
 
-- n = 150 is small; every reported rate carries a bootstrap CI (`metrics.py`).
-- Vector-store retrieval modes are explicit stubs (build-order step 4).
-- Source filing PDFs are not vendored here; fetch the `pdfs/` folder from the
-  FinanceBench repo for `in_context` mode.
+- The source filing PDFs are not included (they are large and not mine to redistribute). Fetch the `pdfs/` folder from the FinanceBench repository for the retrieval and in-context modes.
+- The judge scores numeric answers deterministically (scale-invariant, so `$1577.00`, `$1,577 million`, and `$1.577 billion` all match) and sends qualitative answers to an LLM-judge validated against human labels.
+- Every reported rate carries a bootstrap confidence interval; the sample is small by design (cost), which is stated as a limitation rather than smoothed over.
