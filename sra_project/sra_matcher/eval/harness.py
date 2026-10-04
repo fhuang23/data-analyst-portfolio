@@ -64,11 +64,12 @@ async def _score_one(session_service, runner, case, i, attempt):
 _TRANSIENT = ("429", "RESOURCE_EXHAUSTED", "503", "UNAVAILABLE", "500", "INTERNAL", "DEADLINE")
 
 
-async def _run_agent(cases):
+async def _run_agent(cases, backend='gemini'):
     """Run the reasoner over every case, with a live counter and retry/backoff."""
     from google.adk.runners import Runner
     from google.adk.sessions import InMemorySessionService
-    from ..agents import _reasoner
+    from ..agents import build_reasoner
+    _reasoner = build_reasoner(backend)
 
     session_service = InMemorySessionService()
     runner = Runner(agent=_reasoner, app_name="sra_eval", session_service=session_service)
@@ -157,23 +158,24 @@ def _report(cases, base_preds, agent_preds, verdicts, usage, w_fn, w_fp):
         print(f"  {case.trial.get('nct_id','?'):12} {case.gold_label:^4} {bp:^4} {ap:^5}  {case.note}{flag}")
 
 
-async def evaluate(cases, *, dry_run=False, w_fn=10.0, w_fp=1.0):
+async def evaluate(cases, *, dry_run=False, w_fn=10.0, w_fp=1.0, backend='gemini'):
     """Score a list of EvalCase. The single entry point for any dataset."""
     base_preds = [baseline.predict(_patient_of(c), c.trial) for c in cases]
     if dry_run:
         _report(cases, base_preds, None, None, None, w_fn, w_fp)
         return
-    agent_preds, verdicts, usage = await _run_agent(cases)
+    agent_preds, verdicts, usage = await _run_agent(cases, backend=backend)
     _report(cases, base_preds, agent_preds, verdicts, usage, w_fn, w_fp)
 
 
 def main() -> None:
     ap = argparse.ArgumentParser(description="SRA eligibility eval harness (synthetic set)")
     ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--reasoner", choices=["gemini", "qwen"], default="gemini")
     ap.add_argument("--w-fn", type=float, default=10.0)
     ap.add_argument("--w-fp", type=float, default=1.0)
     args = ap.parse_args()
-    asyncio.run(evaluate(SYNTHETIC_CASES, dry_run=args.dry_run, w_fn=args.w_fn, w_fp=args.w_fp))
+    asyncio.run(evaluate(SYNTHETIC_CASES, dry_run=args.dry_run, w_fn=args.w_fn, w_fp=args.w_fp, backend=args.reasoner))
 
 
 if __name__ == "__main__":

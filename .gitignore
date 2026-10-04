@@ -1,0 +1,13 @@
+.env
+*.env
+__pycache__/
+*.pyc
+.DS_Store
+.adk/
+trec_cases.json
+qrels2021.txt
+topics2021.xml
+trial_cache.json
+pairs.jsonl
+*audit_dump.json
+*review.txt

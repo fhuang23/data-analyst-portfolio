@@ -10,10 +10,16 @@ APP_NAME = "sra_matcher"
 DEFAULT_USER_ID = "eval-user"
 
 # Cheap model: intake structuring (and, if you split it out, per-criterion parsing).
-INTAKE_MODEL = os.getenv("SRA_INTAKE_MODEL", "gemini-3.1-flash-lite")
+INTAKE_MODEL = os.getenv("SRA_INTAKE_MODEL", "gemini-2.5-flash")
 
 # Stronger model: the eligibility judgment where a wrong call has a cost.
-REASONER_MODEL = os.getenv("SRA_REASONER_MODEL", "gemini-3.7-flash")
+REASONER_MODEL = os.getenv("SRA_REASONER_MODEL", "gemini-2.5-pro")
 
 # Coarse-retrieval page size = size of the candidate set the reasoner scores.
 MAX_CANDIDATES = int(os.getenv("SRA_MAX_CANDIDATES", "25"))
+
+# --- self-hosted contender (fine-tuned Qwen via vLLM) ------------------------
+# Point at your local OpenAI-compatible vLLM server. QWEN_MODEL is the model or
+# LoRA-module name you served it under (e.g. "sra" if you used --lora-modules).
+VLLM_BASE_URL = os.getenv("SRA_VLLM_BASE_URL", "http://localhost:8000")
+QWEN_MODEL = os.getenv("SRA_QWEN_MODEL", "qwen3:4b")

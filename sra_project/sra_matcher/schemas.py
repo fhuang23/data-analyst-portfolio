@@ -16,12 +16,7 @@ class Sex(str, Enum):
 
 
 class PatientProfile(BaseModel):
-    """Structured patient representation from the intake stage.
-
-    Hold only the features eligibility criteria actually turn on. Never put raw
-    identifiers here (name, MRN, date of birth) — store an integer age, not a DOB.
-    See the data-governance note in the README.
-    """
+    """Structured patient representation from the intake stage."""
     conditions: list[str] = Field(default_factory=list)
     age_years: Optional[int] = None
     sex: Sex = Sex.ALL
@@ -36,7 +31,7 @@ class PatientProfile(BaseModel):
 class Verdict(str, Enum):
     MET = "met"
     NOT_MET = "not_met"
-    UNKNOWN = "unknown"  # needs-info: surfaced to a screener, never silently dropped
+    UNKNOWN = "unknown"
 
 
 class CriterionVerdict(BaseModel):

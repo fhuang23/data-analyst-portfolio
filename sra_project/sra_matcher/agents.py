@@ -1,9 +1,11 @@
 """The four pipeline stages.
 
-Two are LLM agents (intake structuring, per-candidate reasoning); two are
-deterministic custom agents (retrieval, ranking). Keeping retrieval and ranking
-LLM-free is deliberate: retrieval is the baseline the reasoner must beat, and
-ranking is arithmetic, not judgment.
+Intake stays an LLM agent (structuring). Retrieval and ranking stay
+deterministic. The eligibility fanout no longer owns an LLM — it owns the loop
+and delegates each per-candidate judgment to a pluggable Reasoner (reasoners.py).
+Swapping Gemini for the fine-tuned Qwen or the rules baseline is a one-line
+change in pipeline.py and touches nothing here, which is exactly the property the
+eval harness relies on.
 """
 from __future__ import annotations
 
@@ -16,7 +18,8 @@ from google.adk.events import Event
 from google.genai import types
 
 from . import config, prompts, state
-from .schemas import PatientProfile, TrialLabel, TrialVerdict
+from .reasoners import Reasoner
+from .schemas import PatientProfile, TrialLabel
 from .tools.ctgov import search_trials
 
 
@@ -26,8 +29,6 @@ def _say(author: str, text: str) -> Event:
 
 
 # --- Stage 1: intake (LLM, structured output) --------------------------------
-# Receives the user's free-text history; emits a PatientProfile into state.
-# output_schema forces valid JSON; output_key writes it to session.state.
 intake_agent = LlmAgent(
     name="intake",
     model=config.INTAKE_MODEL,
@@ -40,10 +41,7 @@ intake_agent = LlmAgent(
 # --- Stage 2: retrieval (deterministic tool call, NOT an LLM) ----------------
 class RetrievalAgent(BaseAgent):
     """Coarse structured filter against CT.gov: condition + status (+ location).
-
-    This IS the baseline. Everything the reasoning stage adds is measured against
-    what this returns.
-    """
+    This IS the baseline everything downstream is measured against."""
 
     async def _run_async_impl(self, ctx: InvocationContext) -> AsyncGenerator[Event, None]:
         profile = ctx.session.state.get(state.PATIENT_PROFILE) or {}
@@ -67,59 +65,49 @@ class RetrievalAgent(BaseAgent):
 
 
 # --- Stage 3: per-candidate eligibility reasoning (fan-out over the list) -----
-# The inner reasoner reads one candidate + the profile via {..} templating and
-# writes a structured TrialVerdict back to state.
-_reasoner = LlmAgent(
-    name="eligibility_reasoner",
-    model=config.REASONER_MODEL,
-    instruction=prompts.REASONER_INSTRUCTION,
-    output_schema=TrialVerdict,
-    output_key=state.CURRENT_VERDICT,
-)
-
-
 class EligibilityFanout(BaseAgent):
-    """Maps the reasoner over the candidate list.
+    """Maps a pluggable Reasoner over the candidate list.
 
-    ADK has no native 'map a sub-agent over a dynamic collection' primitive
-    (LoopAgent repeats for refinement; ParallelAgent needs a fixed sub-agent set),
-    so a custom BaseAgent owns the loop and runs the sub-agent once per candidate.
+    The reasoner is a plain object (reasoners.Reasoner), not an ADK sub-agent, so
+    it's held outside the pydantic model fields via object.__setattr__. That's the
+    one ADK-specific wart here — if your google-adk version rejects it, declare a
+    typed field with arbitrary_types_allowed instead. Everything else is
+    contender-agnostic: same state seam in (patient_profile_json,
+    current_candidate_json), same TrialVerdict out.
     """
 
-    reasoner: LlmAgent
-
-    def __init__(self, reasoner: LlmAgent):
-        # Pass the sub-agent as a typed field AND register it via sub_agents so
-        # the framework knows the hierarchy (tracing, lifecycle).
-        super().__init__(name="eligibility_fanout", reasoner=reasoner, sub_agents=[reasoner])
+    def __init__(self, reasoner: Reasoner, name: str = "eligibility_fanout"):
+        super().__init__(name=name)
+        object.__setattr__(self, "_reasoner", reasoner)
 
     async def _run_async_impl(self, ctx: InvocationContext) -> AsyncGenerator[Event, None]:
         candidates = ctx.session.state.get(state.CANDIDATES, [])
+        profile_json = ctx.session.state.get(state.PATIENT_PROFILE_JSON, "{}")
         verdicts: list[dict] = []
+        elapsed = 0.0
 
-        # Criteria are static per NCT id + record version, so this is the natural
-        # place to cache parsed criteria and skip re-reasoning unchanged trials.
-        # cache: dict[str, dict] = load_criteria_cache()   # TODO
-
+        # Criteria are static per NCT id + record version, so this stays the
+        # natural place to cache parsed criteria and skip re-reasoning. TODO.
         for cand in candidates:
-            ctx.session.state[state.CURRENT_CANDIDATE_JSON] = json.dumps(cand)
-            async for event in self.reasoner.run_async(ctx):
-                yield event  # surface the reasoner's events for tracing
-            verdict = ctx.session.state.get(state.CURRENT_VERDICT)
-            if verdict is not None:
-                verdicts.append(verdict if isinstance(verdict, dict) else verdict.model_dump())
+            cand_json = json.dumps(cand)
+            ctx.session.state[state.CURRENT_CANDIDATE_JSON] = cand_json
+            result = self._reasoner.judge(profile_json, cand_json)
+            ctx.session.state[state.CURRENT_VERDICT] = result.verdict.model_dump()
+            verdicts.append(result.verdict.model_dump())
+            elapsed += result.usage.wall_seconds
 
         ctx.session.state[state.VERDICTS] = verdicts
-        yield _say(self.name, f"Scored {len(verdicts)} candidates.")
+        yield _say(
+            self.name,
+            f"Scored {len(verdicts)} candidates via {self._reasoner.name} "
+            f"in {elapsed:.1f}s.",
+        )
 
 
 # --- Stage 4: ranking / triage (deterministic) -------------------------------
 class RankingAgent(BaseAgent):
     """Keep eligible + uncertain; order by confidence, then fewest unknowns.
-
-    The 'uncertain' bucket is intentionally surfaced, not dropped — in a research
-    setting a human screener adjudicates it.
-    """
+    The 'uncertain' bucket is surfaced to a human screener, never dropped."""
 
     async def _run_async_impl(self, ctx: InvocationContext) -> AsyncGenerator[Event, None]:
         verdicts = ctx.session.state.get(state.VERDICTS, [])
@@ -130,3 +118,32 @@ class RankingAgent(BaseAgent):
         keep.sort(key=lambda v: (-float(v.get("confidence", 0.0)), int(v.get("unknown_count", 0))))
         ctx.session.state[state.SHORTLIST] = keep
         yield _say(self.name, f"Shortlist: {len(keep)} trials for screener review.")
+
+
+# --- Module-level reasoner agents for the eval harness ----------------------
+# The harness drives a standalone LlmAgent through an ADK Runner. Restore that
+# entry point, and make the backend switchable so Gemini and Qwen run through
+# the identical harness path (true apples-to-apples).
+from google.adk.models.lite_llm import LiteLlm
+from .schemas import TrialVerdict
+
+
+def build_reasoner(backend: str = "gemini"):
+    """Return an eligibility-reasoner LlmAgent for the given backend.
+    'gemini' uses config.REASONER_MODEL; 'qwen' uses local Ollama via LiteLLM.
+    """
+    if backend == "qwen":
+        model = LiteLlm(model=f"ollama_chat/{config.QWEN_MODEL}")
+    else:
+        model = config.REASONER_MODEL
+    return LlmAgent(
+        name="eligibility_reasoner",
+        model=model,
+        instruction=prompts.REASONER_INSTRUCTION,
+        output_schema=TrialVerdict,
+        output_key=state.CURRENT_VERDICT,
+    )
+
+
+# Backward-compatible default the harness imports.
+_reasoner = build_reasoner("gemini")

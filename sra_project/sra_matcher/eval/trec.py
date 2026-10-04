@@ -166,7 +166,7 @@ async def main_async(args):
     print(f"Built {len(cases)} scoreable cases "
           f"({sum(c.gold_label for c in cases)} eligible / "
           f"{sum(1 for c in cases if not c.gold_label)} not).")
-    await evaluate(cases, dry_run=args.dry_run, w_fn=args.w_fn, w_fp=args.w_fp)
+    await evaluate(cases, dry_run=args.dry_run, w_fn=args.w_fn, w_fp=args.w_fp, backend=args.reasoner)
 
 
 def main():
@@ -179,6 +179,8 @@ def main():
     ap.add_argument("--no-intake", action="store_true",
                     help="skip intake structuring; pass raw topic text as the profile")
     ap.add_argument("--dry-run", action="store_true", help="baseline only, no model")
+    ap.add_argument("--reasoner", choices=["gemini", "qwen"], default="gemini",
+                    help="which reasoner backend to score")
     ap.add_argument("--w-fn", type=float, default=10.0)
     ap.add_argument("--w-fp", type=float, default=1.0)
     args = ap.parse_args()

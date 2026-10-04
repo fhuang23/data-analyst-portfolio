@@ -1,104 +1,100 @@
-# SRA Matcher: Clinical Trial Eligibility Matching Agent
+# Clinical Trial Eligibility Matching: An Agentic Pipeline and Its Evaluation
 
-An LLM agent that matches patients to clinical trials by reasoning over free-text eligibility criteria, built on Google's Agent Development Kit (ADK) with [ClinicalTrials.gov](https://clinicaltrials.gov) as the data source.
+## Summary
 
-The interesting part of this project is not the agent. It is the evaluation. I benchmarked the LLM reasoner against two baselines (a hand-written rules engine and an XGBoost classifier) on the TREC 2021 Clinical Trials track, scored on two axes at once (accuracy and a cost model that penalizes false negatives 10x more than false positives), to answer a specific question: does LLM reasoning earn its keep on this task, or is a cheaper model good enough?
+I built an LLM agent that matches patients to clinical trials by reasoning over free-text
+eligibility criteria, and a rigorous harness to evaluate it. The project's primary output is not
+a deployable system but a **controlled evaluation with an honest negative result**: model
+capability manifests clearly as evidence-grounding (a frontier model is far more faithful than a
+small local one), but grounding alone does not make the system trustworthy for clinical
+screening. The evaluation itself surfaced the key limitation — assessing a clinical-reasoning
+agent's correctness requires clinical expertise, which bounds both what the system can do
+autonomously and what a non-clinical evaluator can certify.
 
-## Results
+## What I built
 
-Evaluated on 200 physician-judged patient-trial pairs from TREC 2021, scored on F1 (higher is better) and a total misclassification cost under a 10:1 false-negative-to-false-positive matrix (lower is better):
+A four-stage pipeline (Google ADK):
 
-| Approach | F1 | Cost | Notes |
-|---|---|---|---|
-| Rules baseline | 0.519 | 130 | Condition, age, and sex filtering |
-| XGBoost (5-fold CV) | 0.519 | 387 | TF-IDF and structured features |
-| LLM reasoner (zero-shot) | **0.605** | 276 | Highest F1, but not the cheapest |
+1. **Intake** (LLM) — structures free-text patient history into a typed profile.
+2. **Retrieval** (deterministic) — coarse filter against ClinicalTrials.gov; serves as the baseline.
+3. **Eligibility reasoning** (pluggable LLM) — per-criterion met / not-met / unknown judgments
+   with cited evidence, rolled up to eligible / ineligible / uncertain. The reasoner is a
+   swappable slot (local Qwen 1.7B via Ollama, or Gemini via API) so models run through an
+   identical path.
+4. **Ranking** (deterministic) — shortlists eligible + uncertain for human review.
 
-Three findings, and the tension between the first two is the real story:
+An evaluation harness scores any reasoner against physician-judged labels, reporting
+precision/recall, a cost-weighted error (false negatives weighted 10x false positives, since
+missing an eligible patient is the expensive error), **evidence faithfulness** (fraction of cited
+evidence found verbatim in the criteria), and **abstention rate**.
 
-1. **The LLM reasoner had the highest F1 by a clear margin (0.605 vs 0.519 for both baselines).** Eligibility matching is a reasoning task, not a lookup task, and the gap showed up exactly where you would expect: criteria phrased as negations, comparative thresholds, and implicit clinical logic.
-2. **But the LLM was not the cheapest under the cost model.** The rules baseline came in at cost 130 against the LLM's 276. So the honest question this benchmark surfaces is not "which model wins" but "is the LLM's accuracy gain worth roughly double the misclassification cost for a given deployment?" That tradeoff, not a single leaderboard number, is what a real screening system would have to decide.
-3. **XGBoost only matched the rules baseline on F1, and it was the most expensive.** Not because the model was weak, but because the signal was not there: every engineered feature came back near-zero importance, with the single most important feature being patient-description length (importance 0.065). Eligibility reasoning has almost no lexical surface signal for a bag-of-features model to exploit; two trials with opposite inclusion logic can share nearly identical vocabulary. This is easy to miss if you only report your best model, so I kept it front and center. It is a statement about the problem, not the classifier.
+## Data
 
-The 10:1 cost weighting reflects that the error types are not symmetric: missing an eligible patient (a false negative) is treated as far more costly than surfacing an ineligible one for review, so the cost column penalizes the two error types accordingly rather than treating plain F1 as the whole picture.
+Patients are physician-authored synthetic vignettes from the TREC 2021 Clinical Trials track;
+relevance labels (0 = not relevant, 1 = excluded, 2 = eligible) are the track's expert assessor
+judgments; trial eligibility text is fetched from ClinicalTrials.gov. I map relevance-2 to
+"eligible" and 0/1 to "ineligible," treating topically-relevant-but-excluded trials as
+non-surfaced. Labels are pooled and imperfect — a limitation that proved central.
 
-## How it works
+> Note: the TREC topics/qrels and fetched trial text are not redistributed in this repo (usage
+> terms / size). The code expects them locally; see the data section of the scripts for the
+> expected file names.
 
-A four-stage retrieve-then-reason pipeline:
+## Findings
 
-1. **Retrieve.** Pull candidate trials from ClinicalTrials.gov for a given patient profile, narrowing the search space before any expensive reasoning happens.
-2. **Parse.** Extract and structure the free-text eligibility criteria (inclusion and exclusion) from each candidate trial.
-3. **Reason.** The LLM agent evaluates the patient against each criterion and produces a per-trial eligibility judgment with its reasoning.
-4. **Rank.** Aggregate the per-criterion judgments into a final match decision and ordering.
+**1. Capability shows up as grounding.** On matched conditions, the local 1.7B had evidence
+faithfulness of **0.41** (it fabricated the majority of its citations), while Gemini scored
+**0.99** (nearly all citations verbatim). A manual audit of the 1.7B's disagreements independently
+confirmed this: roughly 10 of 12 were genuine errors, consistent with the measured hallucination
+rate. Two independent methods agreeing is the strongest result here.
 
-Separating retrieval from reasoning keeps the expensive LLM step focused on the small set of trials that actually warrant it, which is both a cost and a latency decision.
+**2. The two models fail in opposite directions.** The 1.7B errs by *reckless over-surfacing*
+(hallucinated eligibility -> false positives). Gemini, on 200 pairs across 20 patients, errs by
+*cautious over-rejection*: 63/200 disagreements, skewed toward false negatives (36). It does not
+fabricate; it over-applies real criteria.
 
-## Tech stack
+**3. Grounded over-rejection has distinct causes.** Auditing the false negatives from stated
+evidence only (no clinical inference), two separable causes emerged. *Input under-specification*:
+fed raw history rather than structured profiles, the model correctly could not verify criteria
+whose facts were absent — an engineering-fixable limitation. *Interpretive rigidity*: in other
+cases the model had the information but applied criteria too literally or inferred unstated facts
+(e.g. assuming a treatment typical for a diagnosis) — a genuine judgment gap that structured input
+would not fix. A subset also rejected while flagging an inclusion as unverifiable, violating the
+specified abstention policy — a calibration weakness provable by logic alone.
 
-- **Agent framework:** Google Agent Development Kit (ADK)
-- **LLM:** Gemini (via Google AI Studio API key)
-- **Baselines:** scikit-learn / XGBoost, plus a hand-written rules engine
-- **Data source:** ClinicalTrials.gov API
-- **Benchmark:** TREC 2021 Clinical Trials track
-- **Language:** Python
+**4. The central limitation: most disagreements cannot be adjudicated without clinical expertise.**
+As a non-clinical evaluator, I could confidently classify only a minority of Gemini's
+disagreements — clear errors (unstated-fact inference, policy-violating rejection) and clear label
+errors (e.g. a dialysis patient failing a hard creatinine-clearance cutoff, definitionally
+impossible to meet). The majority were genuine clinical-interpretation questions beyond a
+layperson's ability to certify. This is itself the finding.
 
-## Evaluation methodology
+## Conclusion
 
-The benchmark uses 200 physician-judged patient-trial pairs from the TREC 2021 Clinical Trials track. Each approach produces an eligibility decision for every pair, scored against the gold labels on two axes: standard F1, and a total misclassification cost under a 10:1 false-negative-to-false-positive weighting. Reporting both, rather than collapsing them into one figure, is deliberate: it keeps the accuracy-versus-cost tradeoff visible instead of hiding it inside a single metric. The XGBoost baseline was 5-fold cross-validated on the same pairs, so it had access to training labels the zero-shot LLM never saw, which makes its inability to beat the rules baseline a finding about the task rather than about tuning.
+A grounded frontier model is a plausible **assistive triage layer** — it surfaces candidates and
+flags uncertainty — but this evaluation does not support autonomous deployment or clinician-
+workload *replacement*. Its errors are the expensive kind (dropping eligible patients), its
+disagreements with expert labels are mostly unadjudicable without clinicians, and the benchmark
+itself is too label-noisy to cleanly separate model quality from label quality beyond a point.
+Validating this class of system requires clinical reviewers in the loop — precisely the oversight
+the system was meant to assist, not remove.
 
-## Getting started
+## Cost and infrastructure notes
 
-```bash
-# Clone the portfolio repo and enter this project
-git clone https://github.com/fhuang23/data-analyst-portfolio.git
-cd data-analyst-portfolio/sra_project
+The local model is free but RAM-bound (a 16GB machine barely runs a 4B model). The frontier model
+costs ~$0.003/pair (~$0.70 for 200 pairs) but free-tier API quotas (~20 requests/day) make batch
+evaluation impractical without billing. This local-vs-hosted tradeoff — free-but-constrained vs
+capable-but-metered — is a practical finding for anyone choosing where to run eval-scale LLM
+workloads.
 
-# Environment
-pip install -r requirements.txt
+## Honest limitations
 
-# Configure your Gemini API key
-export GOOGLE_API_KEY="your-key-here"
+Small samples (30-200 pairs, few topics) mean accuracy figures are illustrative, not population
+estimates; the grounding and faithfulness results, on larger denominators, carry more weight. A
+single benchmark. Non-clinical auditing has a hard ceiling. An initial audit was too lenient and
+was corrected after measuring faithfulness — the stricter count is reported.
 
-# Launch the agent (opens the ADK web UI to run patient profiles)
-adk web
+## Stack
 
-# Reproduce the evaluation (all three approaches on TREC 2021)
-python -m sra_matcher.eval.harness
-```
-
-## Project structure
-
-```
-sra_project/
-  sra_matcher/            # ADK agent package
-    pipeline.py           # four-stage retrieve-then-reason orchestration
-    agent.py / agents.py  # agent definitions
-    schemas.py            # Pydantic contracts passed between stages
-    prompts.py            # reasoning prompts
-    state.py / config.py  # session state and configuration
-    main.py               # package entry point
-    tools/
-      ctgov.py            # ClinicalTrials.gov API client
-    eval/                 # evaluation harness (the core deliverable)
-      harness.py          # runs and scores all three approaches
-      baseline.py         # non-LLM baseline(s)
-      metrics.py          # F1 and cost-weighted scoring
-      trec.py             # loads TREC 2021 topics and qrels
-  trec_cases.json         # 200 fetched TREC 2021 patient-trial cases
-  qrels2021.txt           # TREC 2021 gold relevance judgments
-  topics2021.xml          # TREC 2021 patient topics
-  requirements.txt
-  README.md
-```
-
-## Limitations and future work
-
-- Zero-shot reasoning was the strongest baseline; few-shot and structured prompting were not fully explored and are a clear next step.
-- The benchmark is TREC 2021 only. Broader validation across trial types and patient populations would strengthen the eligibility claims.
-- The retrieval stage is a candidate for improvement: better first-stage recall would raise the ceiling on everything downstream.
-
-## About this project
-
-Built as the flagship piece of my agentic AI portfolio. My background is roughly fifteen years as a professional poker player, a career built on quantitative decision-making under uncertainty and cost-weighted expected value, which is also how I approached the evaluation design here. I am currently transitioning into data analytics, AI/ML, and research roles.
-
-Portfolio: [github.com/fhuang23/data-analyst-portfolio](https://github.com/fhuang23/data-analyst-portfolio)
+Python, Google ADK, google-genai, Ollama (local Qwen), pydantic (typed verdict schema),
+ClinicalTrials.gov API, TREC 2021 Clinical Trials benchmark.
